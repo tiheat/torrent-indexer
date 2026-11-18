@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,10 +21,13 @@ import (
 )
 
 var rede_torrent = IndexerMeta{
-	Label:       "rede_torrent",
-	URL:         utils.GetIndexerURLFromEnv("INDEXER_REDE_TORRENT_URL", "https://redetorrent.com/"),
-	SearchURL:   "index.php?s=",
-	PagePattern: "%s",
+	Label: "rede_torrent",
+	URL:   utils.GetIndexerURLFromEnv("INDEXER_REDE_TORRENT_URL", "https://redestorrents.com/"),
+	// the redesigned search form submits "busca"; the legacy "?s=" parameter is
+	// ignored and answers every query with the homepage listing. As of 2026-11
+	// the form no longer carries the anti-bot "token" field, so a plain GET works.
+	SearchURL:   "index.php?busca=",
+	PagePattern: "pagina/%s/",
 }
 
 func (i *Indexer) HandlerRedeTorrentIndexer(w http.ResponseWriter, r *http.Request) {
@@ -40,17 +44,17 @@ func (i *Indexer) HandlerRedeTorrentIndexer(w http.ResponseWriter, r *http.Reque
 	q := r.URL.Query().Get("q")
 	page := r.URL.Query().Get("page")
 
-	// URL encode query param
-	q = url.QueryEscape(q)
-	url := metadata.URL
+	// search results are not paginated (the site returns a single page), so
+	// "page" only applies to the listing
+	targetURL := metadata.URL
 	if q != "" {
-		url = fmt.Sprintf("%s%s%s", url, metadata.SearchURL, q)
+		targetURL = fmt.Sprintf("%s%s%s", targetURL, metadata.SearchURL, url.QueryEscape(q))
 	} else if page != "" {
-		url = fmt.Sprintf(fmt.Sprintf("%s%s", url, metadata.PagePattern), page)
+		targetURL = fmt.Sprintf(fmt.Sprintf("%s%s", targetURL, metadata.PagePattern), page)
 	}
 
-	logging.InfoWithRequest(r).Str("target_url", url).Msg("Processing indexer request")
-	resp, err := i.requester.GetDocument(ctx, url)
+	logging.InfoWithRequest(r).Str("target_url", targetURL).Msg("Processing indexer request")
+	resp, err := i.requester.GetDocument(ctx, targetURL)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		err = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -69,25 +73,20 @@ func (i *Indexer) HandlerRedeTorrentIndexer(w http.ResponseWriter, r *http.Reque
 		if err != nil {
 			logging.ErrorWithRequest(r).Err(err).Msg("Failed to encode error response")
 		}
-
 		i.metrics.IndexerErrors.WithLabelValues(metadata.Label).Inc()
 		return
 	}
 
-	var links []string
-	doc.Find(".capa_lista").Each(func(i int, s *goquery.Selection) {
-		link, _ := s.Find("a").Attr("href")
-		links = append(links, link)
-	})
+	links := extractLinksRedeTorrent(doc)
 
 	// if no links were indexed, expire the document in cache
 	if len(links) == 0 {
-		_ = i.requester.ExpireDocument(ctx, url)
+		_ = i.requester.ExpireDocument(ctx, targetURL)
 	}
 
 	// extract each torrent link
 	indexedTorrents := utils.ParallelFlatMap(links, func(link string) ([]schema.IndexedTorrent, error) {
-		return getTorrentsRedeTorrent(ctx, i, link, url)
+		return getTorrentsRedeTorrent(ctx, i, link, targetURL)
 	})
 
 	// Apply post-processors
@@ -114,96 +113,54 @@ func getTorrentsRedeTorrent(ctx context.Context, i *Indexer, link, referer strin
 		return nil, err
 	}
 
-	article := doc.Find(".conteudo")
-	// title pattern: "Something - optional balbla (dddd) some shit" - extract "Something" and "dddd"
-	titleRe := regexp.MustCompile(`^(.*?)(?: - (.*?))? \((\d{4})\)`)
-	titleP := titleRe.FindStringSubmatch(article.Find("h1").Text())
-	if len(titleP) < 3 {
+	// the details page no longer has a parseable <h1> or #informacoes block, so
+	// title, year and imdb come from the schema.org Movie block the new theme
+	// emits for SEO, with the breadcrumb and <h1> as fallbacks.
+	title, year, imdbLink := extractMovieJSONLDRedeTorrent(doc)
+	if title == "" {
+		title = strings.TrimSpace(doc.Find(".breadcrumb-item.active [itemprop=\"name\"]").First().Text())
+	}
+	if title == "" {
+		title = strings.TrimSpace(doc.Find("h1").First().Text())
+	}
+	if title == "" {
 		return nil, fmt.Errorf("could not extract title from %s", link)
 	}
-	title := strings.TrimSpace(titleP[1])
-	year := strings.TrimSpace(titleP[3])
 
-	textContent := article.Find(".apenas_itemprop")
+	textContent := doc.Text()
 	date := getPublishedDateFromMeta(doc)
-	magnets := textContent.Find("a[href^=\"magnet\"]")
-	var magnetLinks []string
-	magnets.Each(func(i int, s *goquery.Selection) {
-		magnetLink, _ := s.Attr("href")
-		magnetLinks = append(magnetLinks, magnetLink)
-	})
 
-	var audio []schema.Audio
-	var size []string
-	article.Find("div#informacoes > p").Each(func(i int, s *goquery.Selection) {
-		// pattern:
-		// Filme Bicho de Sete Cabeças Torrent
-		// Título Original: Bicho de Sete Cabeças
-		// Lançamento: 2001
-		// Gêneros: Drama / Nacional
-		// Idioma: Português
-		// Qualidade: 720p / BluRay
-		// Duração: 1h 14 Minutos
-		// Formato: Mp4
-		// Vídeo: 10 e Áudio: 10
-		// Legendas: Português
-		// Nota do Imdb: 7.7
-		// Tamanho: 1.26 GB
+	magnetLinks, sizeByMagnet := extractMagnetsRedeTorrent(doc)
 
-		// we need to manualy parse because the text is not well formatted
-		htmlContent, err := s.Html()
-		if err != nil {
-			logging.Error().
-				Str("url", link).
-				Err(err).Msg("Failed to get HTML content")
-			return
-		}
+	audio := extractAudioRedeTorrent(doc)
+	if len(audio) == 0 {
+		audio = findAudioFromText(textContent)
+	}
+	if year == "" {
+		year = extractYearRedeTorrent(doc)
+	}
+	if year == "" {
+		year = findYearFromText(textContent, title)
+	}
 
-		// remove any \n and \t characters
-		htmlContent = strings.ReplaceAll(htmlContent, "\n", "")
-		htmlContent = strings.ReplaceAll(htmlContent, "\t", "")
-
-		// split by <br> tags and render each line
-		brRe := regexp.MustCompile(`<br\s*\/?>`)
-		htmlContent = brRe.ReplaceAllString(htmlContent, "<br>")
-		lines := strings.Split(htmlContent, "<br>")
-
-		var text strings.Builder
-		for _, line := range lines {
-			// remove any HTML tags
-			re := regexp.MustCompile(`<[^>]*>`)
-			line = re.ReplaceAllString(line, "")
-
-			line = strings.TrimSpace(line)
-			text.WriteString(line + "\n")
-		}
-
-		audio = append(audio, findAudioFromText(text.String())...)
-		y := findYearFromText(text.String(), title)
-		if y != "" {
-			year = y
-		}
-		size = append(size, findSizesFromText(text.String())...)
-	})
-
-	// find any link from imdb
-	imdbLink := ""
-	article.Find("a").Each(func(i int, s *goquery.Selection) {
-		link, _ := s.Attr("href")
-		_imdbLink, err := getIMDBLink(link)
-		if err == nil {
-			imdbLink = _imdbLink
-		}
-	})
-
-	size = utils.StableUniq(size)
+	// find any link from imdb, fallback if JSON-LD didn't have "sameAs"
+	if imdbLink == "" {
+		doc.Find("a").EachWithBreak(func(i int, s *goquery.Selection) bool {
+			href, _ := s.Attr("href")
+			_imdbLink, err := getIMDBLink(href)
+			if err == nil {
+				imdbLink = _imdbLink
+				return false
+			}
+			return true
+		})
+	}
 
 	var chanIndexedTorrent = make(chan schema.IndexedTorrent)
 
 	// for each magnet link, create a new indexed torrent
-	for it, magnetLink := range magnetLinks {
-		it := it
-		go func(it int, magnetLink string) {
+	for _, magnetLink := range magnetLinks {
+		go func(magnetLink string) {
 			magnet, err := magnet.ParseMagnetUri(magnetLink)
 			if err != nil {
 				logging.Error().Err(err).Str("magnet_link", magnetLink).Msg("Failed to parse magnet URI")
@@ -220,10 +177,13 @@ func getTorrentsRedeTorrent(ctx context.Context, i *Indexer, link, referer strin
 
 			title := processTitle(title, magnetAudio)
 
-			// if the number of sizes is equal to the number of magnets, then assign the size to each indexed torrent in order
-			var mySize string
-			if len(size) == len(magnetLinks) {
-				mySize = size[it]
+			mySize := sizeByMagnet[magnetLink]
+			// if the row didn't print a size, the magnet's "xl" param (exact
+			// byte length) is the next best source.
+			if mySize == "" && magnet.Params != nil {
+				if xl := magnet.Params.Get("xl"); xl != "" {
+					mySize = formatBytesToSizeRedeTorrent(xl)
+				}
 			}
 			if mySize == "" {
 				go func() {
@@ -247,7 +207,7 @@ func getTorrentsRedeTorrent(ctx context.Context, i *Indexer, link, referer strin
 				Size:          mySize,
 			}
 			chanIndexedTorrent <- ixt
-		}(it, magnetLink)
+		}(magnetLink)
 	}
 
 	for i := 0; i < len(magnetLinks); i++ {
@@ -256,4 +216,157 @@ func getTorrentsRedeTorrent(ctx context.Context, i *Indexer, link, referer strin
 	}
 
 	return indexedTorrents, nil
+}
+
+// extractAudioRedeTorrent reads the languages off the "Idioma / Áudio" spec
+// card the redesigned details page prints. The card holds the value without the
+// "Idioma:" label findAudioFromText keys on, so the label is put back before
+// parsing — that keeps the language table and the separator handling in the one
+// place that already owns them.
+func extractAudioRedeTorrent(doc *goquery.Document) []schema.Audio {
+	var audio []schema.Audio
+	doc.Find(".spec-text").EachWithBreak(func(i int, s *goquery.Selection) bool {
+		// "Qualidade de Áudio" is a neighbouring card holding a score, so the
+		// label has to match on "Idioma" rather than on "Áudio"
+		if !strings.Contains(s.Find("small").Text(), "Idioma") {
+			return true
+		}
+		audio = findAudioFromText("Idioma: " + strings.TrimSpace(s.Find("strong").Text()))
+		return false
+	})
+	return audio
+}
+
+// extractMagnetsRedeTorrent collects the magnet links of a details page in
+// document order, together with the size the page prints for each one.
+//
+// Sizes have to be read per magnet. Every download option sits in its own
+// ".download-row", whose ".download-name" ends with that release's size
+// ("1ª OPÇÃO DOWNLOAD TORRENT DUBLADO 720P / 796 MB"), while the
+// page repeats one of those sizes further down in a "Tamanho do Arquivo" spec
+// card. Collecting sizes from the whole document and pairing them with the
+// magnets by index therefore lines the wrong size up against the wrong release.
+func extractMagnetsRedeTorrent(doc *goquery.Document) ([]string, map[string]string) {
+	var magnetLinks []string
+	sizeByMagnet := make(map[string]string)
+
+	doc.Find(".download-row").Each(func(i int, s *goquery.Selection) {
+		magnetLink, exists := s.Find("a[href^=\"magnet\"]").First().Attr("href")
+		if !exists {
+			return
+		}
+		magnetLinks = append(magnetLinks, magnetLink)
+		if sizes := findSizesFromText(s.Find(".download-name").Text()); len(sizes) > 0 {
+			sizeByMagnet[magnetLink] = sizes[len(sizes)-1]
+		}
+	})
+
+	// pick up any magnet that isn't inside a ".download-row"
+	doc.Find("a[href^=\"magnet\"]").Each(func(i int, s *goquery.Selection) {
+		if magnetLink, exists := s.Attr("href"); exists {
+			magnetLinks = append(magnetLinks, magnetLink)
+		}
+	})
+	magnetLinks = utils.StableUniq(magnetLinks)
+
+	// some pages print no size on the download row, only the page-wide spec
+	// card. That value can be attributed to a release only when the page offers
+	// a single one.
+	if len(magnetLinks) == 1 && sizeByMagnet[magnetLinks[0]] == "" {
+		doc.Find(".spec-text").EachWithBreak(func(i int, s *goquery.Selection) bool {
+			if !strings.Contains(s.Find("small").Text(), "Tamanho") {
+				return true
+			}
+			if sizes := findSizesFromText(s.Find("strong").Text()); len(sizes) > 0 {
+				sizeByMagnet[magnetLinks[0]] = sizes[0]
+			}
+			return false
+		})
+	}
+
+	return magnetLinks, sizeByMagnet
+}
+
+// extractMovieJSONLDRedeTorrent reads the schema.org "Movie"/"TVSeries" JSON-LD block that the
+// redestorrents.com theme emits for SEO and returns title, year and IMDB link.
+// Returns empty strings for any field it can't find.
+func extractMovieJSONLDRedeTorrent(doc *goquery.Document) (title, year, imdbLink string) {
+	doc.Find("script[type=\"application/ld+json\"]").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		var data struct {
+			Type          string `json:"@type"`
+			Name          string `json:"name"`
+			SameAs        string `json:"sameAs"`
+			CopyrightYear any    `json:"copyrightYear"` // string or number
+		}
+		if err := json.Unmarshal([]byte(s.Text()), &data); err != nil {
+			return true // continue to next script tag
+		}
+		// films are "Movie", series pages (e.g. Animatrix) are "TVSeries"
+		switch data.Type {
+		case "Movie", "TVSeries", "TVSeason", "TVEpisode":
+		default:
+			return true
+		}
+		title = strings.TrimSpace(data.Name)
+		if data.CopyrightYear != nil {
+			year = strings.TrimSpace(fmt.Sprint(data.CopyrightYear))
+		}
+		if l, err := getIMDBLink(data.SameAs); err == nil {
+			imdbLink = l
+		}
+		return false // found it, stop
+	})
+	return
+}
+
+// formatBytesToSizeRedeTorrent converts a byte-length string (as found in a magnet's
+// "xl" param) into a human readable "X.XX GB"/"X.XX MB" string.
+func formatBytesToSizeRedeTorrent(byteStr string) string {
+	bytes, err := strconv.ParseFloat(byteStr, 64)
+	if err != nil || bytes <= 0 {
+		return ""
+	}
+	const unit = 1024.0
+	switch {
+	case bytes >= unit*unit*unit:
+		return fmt.Sprintf("%.2f GB", bytes/(unit*unit*unit))
+	case bytes >= unit*unit:
+		return fmt.Sprintf("%.2f MB", bytes/(unit*unit))
+	default:
+		return fmt.Sprintf("%.2f KB", bytes/unit)
+	}
+}
+
+var redeTorrentYearRe = regexp.MustCompile(`\((\d{4})\)`)
+
+// extractYearRedeTorrent falls back to the release year the page prints in its
+// heading ("Animatrix - A História Antes de Matrix Torrent (2003) Dual Áudio")
+// or in the <time itemprop="datePublished" datetime="2003-01-01"> info pill.
+func extractYearRedeTorrent(doc *goquery.Document) string {
+	for _, text := range []string{
+		doc.Find("h1.movie-title").First().Text(),
+		doc.Find("meta[property=\"og:title\"]").AttrOr("content", ""),
+	} {
+		if m := redeTorrentYearRe.FindStringSubmatch(text); len(m) == 2 {
+			return m[1]
+		}
+	}
+	if dt := doc.Find("time[itemprop=\"datePublished\"]").First().AttrOr("datetime", ""); len(dt) >= 4 {
+		if _, err := strconv.Atoi(dt[:4]); err == nil {
+			return dt[:4]
+		}
+	}
+	return ""
+}
+
+// extractLinksRedeTorrent returns the details-page links of a listing or search
+// results page: both are a grid of <a class="cover-link"><article class="custom-card">.
+func extractLinksRedeTorrent(doc *goquery.Document) []string {
+	var links []string
+	doc.Find("a.cover-link").Each(func(_ int, s *goquery.Selection) {
+		if link, exists := s.Attr("href"); exists && link != "" {
+			links = append(links, link)
+		}
+	})
+	return utils.StableUniq(links)
 }
