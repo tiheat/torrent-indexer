@@ -2,10 +2,12 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,7 +22,7 @@ import (
 
 var starck_filmes = IndexerMeta{
 	Label:       "starck_filmes",
-	URL:         utils.GetIndexerURLFromEnv("INDEXER_STARCK_FILMES_URL", "https://www.starckfilmes-v10.com/"),
+	URL:         utils.GetIndexerURLFromEnv("INDEXER_STARCK_FILMES_URL", "https://starckfilmes-v30.com/"),
 	SearchURL:   "?s=",
 	PagePattern: "page/%s",
 }
@@ -78,11 +80,7 @@ func (i *Indexer) HandlerStarckFilmesIndexer(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var links []string
-	doc.Find(".item").Each(func(i int, s *goquery.Selection) {
-		link, _ := s.Find("div.sub-item > a").Attr("href")
-		links = append(links, link)
-	})
+	links := parseStarckFilmesSearchLinks(doc)
 
 	// if no links were indexed, expire the document in cache
 	if len(links) == 0 {
@@ -119,61 +117,21 @@ func getTorrentStarckFilmes(ctx context.Context, i *Indexer, link, referer strin
 		return nil, err
 	}
 
-	date := getPublishedDateFromRawString(link)
+	date := getStarckFilmesPublishedDate(link)
 
-	post := doc.Find(".post")
-	capa := post.Find(".capa")
-	title := capa.Find(".post-description > h2").Text()
-	post_buttons := post.Find(".post-buttons")
-	magnets := post_buttons.Find("a[href^=\"magnet\"]")
-	var magnetLinks []string
-	magnets.Each(func(i int, s *goquery.Selection) {
-		magnetLink, _ := s.Attr("href")
-		magnetLinks = append(magnetLinks, magnetLink)
-	})
-	dataUs := post_buttons.Find("a[data-u]")
-	dataUs.Each(func(i int, s *goquery.Selection) {
-		dataU, _ := s.Attr("data-u")
-		magnetLink, err := utils.DecodeStarckDataU(dataU)
-		if err != nil {
-			logging.Warn().Err(err).Str("data_u", dataU).Msg("Failed to decode data-u attribute, skipping")
-			return
-		}
-		magnetLinks = append(magnetLinks, magnetLink)
-	})
+	detail := parseStarckFilmesDetail(doc)
+	title := detail.Title
+	year := detail.Year
+	audio := detail.Audio
+	size := detail.Sizes
 
-	var audio []schema.Audio
-	var year string
-	var size []string
-	capa.Find(".post-description p").Each(func(i int, s *goquery.Selection) {
-		// pattern:
-		// Nome Original: 28 Weeks Later
-		// Lançamento: 2007
-		// Duração: 1h 40 min
-		// Gênero: Terror, Suspense, Ficção
-		// Formato: MKV
-		// Tamanho: 2.45 GB
-		// Qualidade de Video: 10
-		// Qualidade do Audio: 10
-		// Idioma: Português | Inglês
-		// Legenda: Português, Inglês, Espanhol
-		var text strings.Builder
-		s.Find("span").Each(func(i int, span *goquery.Selection) {
-			text.WriteString(span.Text())
-			text.WriteString(" ")
-		})
-		audio = append(audio, findAudioFromText(text.String())...)
-		y := findYearFromText(text.String(), title)
-		if y != "" {
-			year = y
-		}
-		size = append(size, findSizesFromText(text.String())...)
-	})
+	magnetLinks := make([]string, 0, len(detail.Downloads))
+	for _, d := range detail.Downloads {
+		magnetLinks = append(magnetLinks, d.Magnet)
+	}
 
 	// TODO: find any link from imdb
 	imdbLink := ""
-
-	size = utils.StableUniq(size)
 
 	var chanIndexedTorrent = make(chan schema.IndexedTorrent)
 
@@ -211,8 +169,8 @@ func getTorrentStarckFilmes(ctx context.Context, i *Indexer, link, referer strin
 			title := processTitle(title, magnetAudio)
 
 			// if the number of sizes is equal to the number of magnets, then assign the size to each indexed torrent in order
-			var mySize string
-			if len(size) == len(magnetLinks) {
+			mySize := detail.Downloads[it].Size
+			if mySize == "" && len(size) == len(magnetLinks) {
 				mySize = size[it]
 			}
 			if mySize == "" {
@@ -246,4 +204,171 @@ func getTorrentStarckFilmes(ctx context.Context, i *Indexer, link, referer strin
 	}
 
 	return indexedTorrents, nil
+}
+
+// starckFilmesDownload is a single download entry found on a starck-filmes detail page.
+type starckFilmesDownload struct {
+	Magnet string
+	Size   string
+}
+
+// starckFilmesDetail holds the data extracted from a starck-filmes detail page.
+type starckFilmesDetail struct {
+	Title     string
+	Year      string
+	Audio     []schema.Audio
+	Sizes     []string
+	Downloads []starckFilmesDownload
+}
+
+// parseStarckFilmesSearchLinks returns the detail page links listed on a search/listing page.
+func parseStarckFilmesSearchLinks(doc *goquery.Document) []string {
+	var links []string
+	doc.Find(".item div.sub-item > a[href]").Each(func(_ int, s *goquery.Selection) {
+		link := strings.TrimSpace(s.AttrOr("href", ""))
+		if link != "" {
+			links = append(links, link)
+		}
+	})
+	return utils.StableUniq(links)
+}
+
+// parseStarckFilmesDetail extracts title, year, audio, sizes and magnet links from a detail page.
+func parseStarckFilmesDetail(doc *goquery.Document) starckFilmesDetail {
+	var detail starckFilmesDetail
+
+	post := doc.Find(".post").First()
+	capa := post.Find(".capa")
+	detail.Title = strings.TrimSpace(capa.Find(".post-description > h2").First().Text())
+
+	capa.Find(".post-description p").Each(func(_ int, s *goquery.Selection) {
+		// pattern:
+		// Nome Original: 28 Weeks Later
+		// Lançamento: 2007
+		// Duração: 1h 40 min
+		// Gênero: Terror, Suspense, Ficção
+		// Formato: MKV
+		// Tamanho: 2.45 GB
+		// Qualidade de Video: 10
+		// Qualidade do Audio: 10
+		// Idioma: Português | Inglês
+		// Legenda: Português, Inglês, Espanhol
+		var text strings.Builder
+		s.Find("span").Each(func(_ int, span *goquery.Selection) {
+			text.WriteString(strings.TrimSpace(span.Text()))
+			text.WriteString(" ")
+		})
+		// "Qualidade do Audio: 10" is a rating, not a language list
+		if !strings.HasPrefix(text.String(), "Qualidade") {
+			detail.Audio = append(detail.Audio, findAudioFromText(text.String())...)
+		}
+		if y := findYearFromText(text.String(), detail.Title); y != "" {
+			detail.Year = y
+		}
+		detail.Sizes = append(detail.Sizes, findSizesFromText(text.String())...)
+	})
+	detail.Sizes = utils.StableUniq(detail.Sizes)
+
+	seen := map[string]bool{}
+	addDownload := func(magnetLink string, s *goquery.Selection) {
+		if magnetLink == "" || seen[magnetLink] {
+			return
+		}
+		seen[magnetLink] = true
+		var size string
+		// the current layout shows the size next to each button, e.g. "1080p (2.83 GB)"
+		if sizes := findSizesFromText(s.Closest(".btn-down").Text()); len(sizes) > 0 {
+			size = sizes[0]
+		}
+		detail.Downloads = append(detail.Downloads, starckFilmesDownload{Magnet: magnetLink, Size: size})
+	}
+
+	buttons := post.Find(".post-buttons")
+	buttons.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+		href := strings.TrimSpace(s.AttrOr("href", ""))
+		switch {
+		case utils.IsMagnetLink(href):
+			addDownload(href, s)
+		case strings.Contains(href, "xid="):
+			// current layout: obfuscated magnet inside a redirector link (https://filmedl.com/?xid=...)
+			magnetLink, err := decodeStarckFilmesXid(href)
+			if err != nil {
+				logging.Warn().Err(err).Str("href", href).Msg("Failed to decode xid link, skipping")
+				return
+			}
+			addDownload(magnetLink, s)
+		}
+	})
+	// legacy layout: obfuscated magnet inside the data-u attribute
+	buttons.Find("a[data-u]").Each(func(_ int, s *goquery.Selection) {
+		dataU := s.AttrOr("data-u", "")
+		magnetLink, err := utils.DecodeStarckDataU(dataU)
+		if err != nil {
+			logging.Warn().Err(err).Str("data_u", dataU).Msg("Failed to decode data-u attribute, skipping")
+			return
+		}
+		addDownload(magnetLink, s)
+	})
+
+	return detail
+}
+
+var starckFilmesXidRE = regexp.MustCompile(`[?&]xid=([^&#]+)`)
+
+// decodeStarckFilmesXid decodes the magnet link hidden in the xid query param of the
+// download redirector links. The value is a base64 encoded magnet link whose characters
+// were shuffled with step 3 (same shuffle used by the old data-u attribute).
+func decodeStarckFilmesXid(href string) (string, error) {
+	match := starckFilmesXidRE.FindStringSubmatch(href)
+	if len(match) < 2 {
+		return "", fmt.Errorf("no xid param found")
+	}
+	// PathUnescape keeps '+' (valid base64 char) untouched
+	xid, err := url.PathUnescape(match[1])
+	if err != nil {
+		xid = match[1]
+	}
+
+	unshuffled := starckFilmesUnshuffle(xid, 3)
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err := enc.DecodeString(unshuffled)
+		if err == nil && utils.IsMagnetLink(string(decoded)) {
+			return string(decoded), nil
+		}
+	}
+	return "", fmt.Errorf("decoded xid is not a valid magnet link")
+}
+
+// starckFilmesUnshuffle reverts the step-based shuffle used by starck-filmes.
+func starckFilmesUnshuffle(shuffled string, step int) string {
+	runes := []rune(shuffled)
+	length := len(runes)
+	if length == 0 || step <= 0 {
+		return shuffled
+	}
+	original := make([]rune, length)
+	used := make([]bool, length)
+	index := 0
+	for i := 0; i < length; i++ {
+		for used[index] {
+			index = (index + 1) % length
+		}
+		used[index] = true
+		original[i] = runes[index]
+		index = (index + step) % length
+	}
+	return string(original)
+}
+
+// starck-filmes detail URLs end with the publication date as DD-MM-YYYY, e.g.
+// /catalog/a-odisseia-2026-08-11-2026/ -> 08 Nov 2026
+var starckFilmesSlugDateRE = regexp.MustCompile(`(\d{2}-\d{2}-\d{4})/?$`)
+
+func getStarckFilmesPublishedDate(link string) time.Time {
+	if m := starckFilmesSlugDateRE.FindStringSubmatch(strings.TrimSpace(link)); len(m) > 1 {
+		if date, err := time.Parse("02-01-2006", m[1]); err == nil {
+			return date.UTC()
+		}
+	}
+	return getPublishedDateFromRawString(link)
 }
