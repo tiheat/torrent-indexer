@@ -80,7 +80,7 @@ func HandlerIndex(w http.ResponseWriter, r *http.Request) {
 	commonQueryParams := map[string]string{
 		"q":              "search query",
 		"page":           "page number",
-		"filter_results": "if results with similarity equals to zero should be filtered (true/false)",
+		"filter_results": "if results missing any significant word of the query should be filtered (true/false)",
 		"limit":          "maximum number of results to return",
 		"sortBy":         "sort by field (title, original_title, year, date, seed_count, leech_count, size, similarity)",
 		"sortDirection":  "sort direction (asc or desc, default: desc)",

@@ -23,7 +23,6 @@ import (
 	"github.com/felipemarinho97/torrent-indexer/logging"
 	"github.com/felipemarinho97/torrent-indexer/magnet"
 	"github.com/felipemarinho97/torrent-indexer/schema"
-	goscrape "github.com/felipemarinho97/torrent-indexer/scrape"
 	"github.com/felipemarinho97/torrent-indexer/utils"
 )
 
@@ -48,7 +47,7 @@ func (i *Indexer) HandlerVacaTorrentIndexer(w http.ResponseWriter, r *http.Reque
 		i.metrics.IndexerRequests.WithLabelValues(metadata.Label).Inc()
 	}()
 
-	ctx := r.Context()
+	ctx := withSearchQuery(r.Context(), r)
 	// supported query params: q, season, episode, page, filter_results
 	q := r.URL.Query().Get("q")
 	page := r.URL.Query().Get("page")
@@ -604,10 +603,7 @@ func getTorrentsVacaTorrent(ctx context.Context, i *Indexer, link, referer strin
 				magnetAudio = getAudioFromTitle(releaseTitle, contentAudio)
 			}
 
-			peer, seed, err := goscrape.GetLeechsAndSeeds(ctx, i.redis, i.metrics, infoHash, trackers)
-			if err != nil {
-				logging.Error().Err(err).Str("info_hash", infoHash).Msg("Failed to get leechers and seeders")
-			}
+			peer, seed := scrapePeers(ctx, i, infoHash, trackers, releaseTitle, page.Title)
 
 			// prefer the exact length from the magnet, then the size shown in the
 			// button, then the sizes listed in the post if they match the magnets

@@ -129,10 +129,11 @@ func AddSimilarityCheck(i *Indexer, r *http.Request, torrents []schema.IndexedTo
 		torrents[i].Similarity = edlib.JaccardSimilarity(jLower, qLower, splitLength)
 	}
 
-	// remove the ones with zero similarity
-	if len(torrents) > 20 && r.URL.Query().Get("filter_results") != "" && r.URL.Query().Get("q") != "" {
+	// keep only the torrents whose titles contain every significant query word:
+	// the similarity score above is almost never zero, so it can't filter results
+	if q != "" && r.URL.Query().Get("filter_results") != "" {
 		torrents = utils.Filter(torrents, func(it schema.IndexedTorrent) bool {
-			return it.Similarity > 0
+			return matchesQuery(q, it.Title, it.OriginalTitle)
 		})
 	}
 
